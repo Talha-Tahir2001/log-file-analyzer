@@ -122,3 +122,133 @@ const HTTP_METHODS = new Set([
   "TRACE",
   "CONNECT",
 ]);
+
+function parseCanonicalRest(rest: string, lineNumber: number, timestamp: Date, raw: string): LogEntry | null {  
+  const tokens = rest.trim().split(/\s+/);
+  if (tokens.length < 5) return null;
+ 
+  const [ip, method, rawPath, statusToken, rtToken] = tokens;
+ 
+  if (!HTTP_METHODS.has(method.toUpperCase())) return null;
+ 
+  const status = parseStatusCode(statusToken);
+  const responseTimeMs = parseResponseTime(rtToken);
+  const { path, query } = parsePath(rawPath);
+ 
+  return {
+    timestamp,
+    ip,
+    method: method.toUpperCase(),
+    path,
+    query,
+    statusCode: status,
+    responseTimeMs,
+    raw,
+    lineNumber,
+  };
+}
+
+function parseJsonLine(line: string, lineNumber: number): LogEntry | null {
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return null;
+  }
+ 
+  if (typeof obj !== 'object' || obj === null) return null;
+ 
+  // Timestamp — accept multiple field names
+  const tsRaw = obj['timestamp'] ?? obj['time'] ?? obj['ts'] ?? obj['@timestamp'];
+  let timestamp: Date | null = null;
+  if (typeof tsRaw === 'string') {
+    const parsed = parseTimestamp(tsRaw + ' ');  // add trailing space for epoch regex
+    timestamp = parsed?.date ?? new Date(tsRaw);
+    if (isNaN(timestamp.getTime())) timestamp = null;
+  } else if (typeof tsRaw === 'number') {
+    timestamp = new Date(tsRaw > 1e10 ? tsRaw : tsRaw * 1000);
+  }
+  if (!timestamp) return null;
+ 
+  const method = String(obj['method'] ?? '').toUpperCase();
+  if (method && !HTTP_METHODS.has(method)) return null;
+ 
+  const rawPath = String(obj['path'] ?? obj['url'] ?? obj['uri'] ?? '');
+  if (!rawPath) return null;
+ 
+  const { path, query } = parsePath(rawPath);
+ 
+  const statusRaw = obj['status'] ?? obj['statusCode'] ?? obj['status_code'];
+  const statusCode = statusRaw != null ? parseStatusCode(String(statusRaw)) : null;
+ 
+  const rtRaw = obj['responseTime'] ?? obj['response_time'] ?? obj['duration'] ?? obj['latency'];
+  const responseTimeMs = rtRaw != null ? parseResponseTime(String(rtRaw)) : null;
+ 
+  const ip = String(obj['ip'] ?? obj['remoteAddr'] ?? obj['remote_addr'] ?? obj['client'] ?? '');
+ 
+  return {
+    timestamp,
+    ip: ip || '0.0.0.0',
+    method: method || 'UNKNOWN',
+    path,
+    query,
+    statusCode,
+    responseTimeMs,
+    raw: line,
+    lineNumber,
+  };
+}
+
+export async function parseLogFile(filePath: string): Promise<ParseResult> {
+  const entries: LogEntry[] = [];
+  const malformed: MalformedEntry[] = [];
+  let totalLines = 0;
+  let blankLines = 0;
+ 
+  const fileStream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+ 
+  for await (const line of rl) {
+    totalLines++;
+ 
+    const trimmed = line.trim();
+ 
+    // Blank lines — count them but don't flag as malformed
+    if (trimmed === '') {
+      blankLines++;
+      continue;
+    }
+ 
+    if (/^\s+at\s/.test(line) || /^\s+\.\.\.\s*\d+\s+more/.test(line)) {
+      malformed.push({ raw: line, lineNumber: totalLines, reason: 'stack trace continuation' });
+      continue;
+    }
+     
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      const entry = parseJsonLine(trimmed, totalLines);
+      if (entry) {
+        entries.push(entry);
+      } else {
+        malformed.push({ raw: line, lineNumber: totalLines, reason: 'invalid JSON structure' });
+      }
+      continue;
+    }
+ 
+    // Timestamp-first formats
+    const tsResult = parseTimestamp(trimmed);
+    if (!tsResult) {
+      malformed.push({ raw: line, lineNumber: totalLines, reason: 'unrecognised timestamp' });
+      continue;
+    }
+ 
+    const entry = parseCanonicalRest(tsResult.rest, totalLines, tsResult.date, line);
+    if (!entry) {
+      malformed.push({ raw: line, lineNumber: totalLines, reason: 'incomplete fields after timestamp' });
+      continue;
+    }
+ 
+    entries.push(entry);
+  }
+ 
+  return { entries, malformed, totalLines, blankLines };
+}
